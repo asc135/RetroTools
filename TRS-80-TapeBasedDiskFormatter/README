@@ -1,0 +1,87 @@
+Tape-based Disk Formatter for TRS-80 Model III or 4
+Version 1.4 2021-04-15
+
+This program allows you to exercise the floppy drives on a Model III
+or 4 computer without the use of a bootable DOS diskette.  The resulting
+disks are not set up with a file system of any kind. It requires a
+16K RAM system with disk controller and at least one drive.
+
+The operation (format, read, write, dump), The drive number (0-3),
+number of cylinders (1-96), the starting write precompensation
+cylinder (0-96), number of sides (0-1), the encoding density (S or D)
+representing FM or MFM format, the sector interleave (1-6), and
+number of the first sector (0-1) can be selected by answering the prompts.
+Press <ENTER> to accept the default values shown in [ square brackets ].
+
+Single density formats to 10 sectors of 256 bytes per track.  Double
+density formats to 18 sectors of 256 bytes per track.  Write precompensation
+is enabled by default for cylinder 25 and higher in MFM mode.  Normally
+this may be left at the default, but should be adjusted upwards to
+perhaps 50 if you are using 80 cylinder drives.  An asterisk (*) will
+appear after the side number when write precompensation is enabled
+for format or write operations.
+
+The dump track function is fairly primitive at present. It just dumps
+the first 512 bytes of raw data from cylinder 0 side 0.  I plan to
+add some support for viewing desired areas of the disk.
+
+THIS PROGRAM CAN DESTROY EXISTING DATA ON THE DISKETTE SO USE CAUTION!
+
+To load the program, start cassette BASIC by holding <BREAK> while
+pressing and releasing the orange RESET button.  Select the tape speed
+by responding to Cass? with <ENTER> or H for high speed (1500 baud) or
+L for low speed (500 baud).
+
+At the READY prompt, type SYSTEM and press <ENTER>.
+At the *? prompt type FORMAT and press <ENTER>.
+
+Two asterisks will appear at the upper right of the screen.  The left
+asterisk will remain steady while the right asterisk will blink while
+the program is loading.  If the letter 'D' or 'C' replaces the left
+asterisk, the loading failed.  Try a different volume setting.
+
+After a successful load, which takes under thirty seconds at 1500 baud,
+the program will start automatically and begin prompting the user for
+operation and parameters.  Then the user will be prompted to insert a
+diskette in the target drive and press <ENTER> to start the operation or
+<BREAK> to abort back to the READY prompt.  Likewise hitting <BREAK> at
+any prompt question will return to BASIC.
+
+While an operation is in process, the current cylinder number and side
+will be displayed. The numbers are in hexadecimal.  Why?  Well, the
+conversion is easier. I'll probably change that to decimal later but it's
+not a big priority.
+
+The format operation is followed automatically by a read verify operation.
+
+If you can format, verify, and write successfully, your drives are working
+well. It doesn't imply they are in alignment, however, just functional. You
+can try formatting in one drive and reading in another to see if the radial
+alignment is within a good range.
+
+You can run the program again by typing SYSTEM and just responding
+with "/" then <ENTER> at the *? prompt.
+
+If you wish to modify and/or build the program from source, you can
+get the zmac assembler from http://48k.ca/zmac.html and run it:
+
+    zmac format.z80
+
+The outputs will be in the zout/ directory.
+
+A big shout out and thank you to George Phillips and Peter Phillips for
+making the trs80gp emulator and upgrading the zmac assembler which were
+instrumental in the creation of this software.  Also many thanks to the
+great folks in the Tandy community who answered my questions and helped
+troubleshoot various aspects of the project.
+
+Future capabilities:
+    - function to step the drive heads manually for troubleshooting
+    - function to seek the heads over the full range for cleaning diskettes
+    - read, examine, edit, and write sectors
+    - re-interleave a track
+
+Please feel free to write with any problems, questions, or suggestions.
+
+Amardeep
+asc135@yahoo.com

@@ -1,0 +1,6 @@
+If you wish to modify and/or build the program from source, you can
+get the zmac assembler from http://48k.ca/zmac.html and run it:
+
+    zmac format.z80
+
+The outputs will be in the zout/ directory.

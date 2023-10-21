@@ -1,0 +1,1506 @@
+;-----------------------------------------------------------------------------
+; Tape-based Floppy Disk Formatter
+; TRS-80 Model III 16K or more with FDC
+; Assembles with zmac (http://48k.ca/zmac.html)
+;-----------------------------------------------------------------------------
+; This software is in the public domain.  No warranty expressed nor implied.
+;-----------------------------------------------------------------------------
+; 2021-03-25 A. Chana       Initial Release.
+; 2021-03-29 A. Chana       Fixed lost data register write in write track.
+; 2021-04-01 A. Chana       Completed single density FM support.
+; 2021-04-02 A. Chana       Added operation selection.
+; 2021-04-03 A. Chana       Fixed data_req sync in read_sector.
+; 2021-04-05 A. Chana       Fixed timing issue writing sectors.
+; 2021-04-15 A. Chana       Make all I/O loops consistent.
+;-----------------------------------------------------------------------------
+
+include format.inc
+
+                org     41e2h
+
+                ; auto start after cass load
+                jp      (hl)
+
+                org     4a00h
+
+;-----------------------------------------------------------------------------
+; main routine
+;-----------------------------------------------------------------------------
+start:
+                ; display startup message
+                call    vdcls
+                ld      hl,message
+                call    vdline
+
+                ; initialize data structures and hardware
+                call    initialize
+
+                ; get the target drive, cylinders, sides, density, and interleave
+                call    get_operation
+                call    get_drive
+                call    get_cylinders
+                call    get_wrtprecyl
+                call    get_sides
+                call    get_density
+                call    get_interleave
+                call    get_firstsec
+
+                ; prepare the drive select register value
+                call    prepare_select
+
+                ; prepare the sector interleave table
+                call    prepare_interl
+
+                ; prepare the gap and sector data
+                call    prepare_track
+
+                ; prompt user to insert diskette
+                ld      hl,prompt8
+                call    vdline
+                call    kbwait
+                cmp     a,key_break         ; check for break
+                jr      z,exit
+
+                ; select drive and wait about 303mS for motor speed to stabilize
+                call    select_drive
+                ld      bc,delay_303ms
+                call    delay
+
+                ; dispatch the selected operation
+                ld      a,(operation)
+                cp      key_r
+                jr      z,oper_verify
+                cp      key_w
+                jr      z,oper_write
+                cp      key_d
+                jr      z,oper_dump
+
+                ; format the disk
+oper_format:    call    format_disk
+                jp      nz,handle_error
+                ld      a,key_enter
+                call    vdchar
+
+                ; read verify the disk
+oper_verify:    call    verify_disk
+                jp      nz,handle_error
+                jp      print_done
+
+                ; write the disk
+oper_write:     call    write_disk
+                jp      nz,handle_error
+                jp      print_done
+
+                ; dump the first 512 bytes of track 0
+oper_dump:      call    dump_track
+                jp      nz,handle_error
+                call    kbwait
+
+                ; display completion message
+print_done:     ld      hl,done
+                call    vdline
+
+                ; exit the program
+exit:           call    cleanup
+                jp      ready
+
+                ; handle FDC errors
+handle_error:   call    printbin
+                ld      hl,error_msg
+                call    vdline
+                ld      a,(cylinder)
+                call    printhex
+                ld      a,':'
+                call    vdchar
+                ld      a,(side)
+                call    printhex
+                ld      a,':'
+                call    vdchar
+                ld      a,(sector)
+                call    printhex
+                jp      exit
+
+;-----------------------------------------------------------------------------
+; initialize resources
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+initialize:
+                push    hl
+                push    bc
+                push    de
+
+                ; clear the variables
+                ld      hl,data_start
+                ld      de,data_start+1
+                ld      bc,data_size
+                ld      (hl),0
+                ldir
+
+                ; reset FDC
+                call    reset_fdc
+
+                pop     de
+                pop     bc
+                pop     hl
+
+                ; install the ISR
+                ld      hl,nmi_isr
+                ld      a,0c3h
+                ld      (4049h),a
+                ld      (404ah),hl
+
+                ret
+
+;-----------------------------------------------------------------------------
+; cleanup resources
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+cleanup:
+                ; remove the NMI interrupt service routine
+                ld      hl,0
+                ld      a,0c7h
+                ld      (4049h),a
+                ld      (404ah),hl
+
+                ; restore the ret instruction at address 41e2h and jump to ready prompt
+                ld      a,0c9h
+                ld      (41e2h),a
+                ret
+
+;-----------------------------------------------------------------------------
+; NMI service routine (ISR)
+;-----------------------------------------------------------------------------
+nmi_isr:
+                ; disable NMI and enable INT
+                xor     a
+                out     (irqreg),a
+                pop     hl                  ; fix stack (we won't be doing a retn)
+                ei
+
+                in      a,(cmdstatreg)
+
+                pop     de
+                pop     bc
+                pop     hl
+
+                ret
+
+;-----------------------------------------------------------------------------
+; query operation from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_operation:
+                push    hl
+                push    bc
+                push    de
+                ld      a,key_f             ; store default value
+                ld      (operation),a
+get_oper01:     ld      hl,prompt0
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default of user hit enter
+                jr      z,get_oper03
+                or      20h                 ; convert to lower case
+                cp      key_f
+                jr      z,get_oper03
+                cp      key_r
+                jr      z,get_oper02
+                cp      key_w
+                jr      z,get_oper02
+                cp      key_d
+                jr      nz,get_oper01
+get_oper02:     ld      (operation),a
+get_oper03:     pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query target drive from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_drive:
+                push    hl
+                push    bc
+                push    de
+                xor     a                   ; store default value
+                ld      (drive),a
+get_drive01:    ld      hl,prompt1
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default of user hit enter
+                jr      z,get_drive02
+                cp      '4'
+                jr      nc,get_drive01
+                cp      '0'
+                jr      c,get_drive01
+                and     0fh                 ; convert number from ASCII to binary
+                ld      (drive),a
+get_drive02:    pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query number of cylinders from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_cylinders:
+                push    hl
+                push    bc
+                push    de
+                ld      a,def_cylinders     ; store default value
+                ld      (cylinders),a
+get_cyl01:      ld      hl,prompt2
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,2
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default if user hit enter
+                jr      z,get_cyl02
+                ld      de,input_buffer
+                call    parse_uint
+                ld      a,l
+                cp      max_cylinders
+                jr      nc,get_cyl01
+                cp      min_cylinders
+                jr      c,get_cyl01
+                ld      (cylinders),a
+get_cyl02:      pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query write precompensation start cylinder from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_wrtprecyl:
+                push    hl
+                push    bc
+                push    de
+                ld      a,def_wrtprecyl     ; store default value
+                ld      (wrprecompcyl),a
+get_wpc01:      ld      hl,prompt3
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,2
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default if user hit enter
+                jr      z,get_wpc02
+                ld      de,input_buffer
+                call    parse_uint
+                ld      a,l
+                cp      max_cylinders
+                jr      nc,get_wpc01
+                ld      (wrprecompcyl),a
+get_wpc02:      pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query number of sides from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_sides:
+                push    hl
+                push    bc
+                push    de
+                ld      a,1                 ; store default value
+                ld      (sides),a
+get_sides01:    ld      hl,prompt4
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default of user hit enter
+                jr      z,get_sides02
+                cp      '3'
+                jr      nc,get_sides01
+                cp      '1'
+                jr      c,get_sides01
+                and     0fh                 ; convert number from ASCII to binary
+                ld      (sides),a
+get_sides02:    pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query format density from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_density:
+                push    hl
+                push    bc
+                push    de
+                ld      a,mfm               ; store default values for density
+                ld      (density),a
+get_density01:  ld      hl,prompt5
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default of user hit enter
+                jr      z,get_density02
+                or      20h                 ; convert to lower case
+                cp      key_d
+                jr      z,get_density02
+                cp      key_s
+                jr      nz,get_density01
+                xor     a
+                ld      (density),a
+get_density02:  pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query sector interleave from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_interleave:
+                push    hl
+                push    bc
+                push    de
+                ld      a,def_interleave    ; store default value
+                ld      (interleave),a
+get_interlv01:  ld      hl,prompt6
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default if user hit enter
+                jr      z,get_interlv02
+                cp      '7'
+                jr      nc,get_interlv01
+                cp      '1'
+                jr      c,get_interlv01
+                and     0fh                 ; convert number from ASCII to binary
+                ld      (interleave),a
+get_interlv02:  pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; query first sector number from user
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+get_firstsec:
+                push    hl
+                push    bc
+                push    de
+                ld      a,def_firstsec      ; store default value
+                ld      (first_sector),a
+get_firstsc01:  ld      hl,prompt7
+                call    vdline
+                ld      hl,input_buffer
+                ld      b,1
+                call    kbline
+                jp      c,get_abort         ; abort if user hit break
+                ld      a,(hl)
+                cp      key_enter           ; use default if user hit enter
+                jr      z,get_firstsc02
+                cp      '2'
+                jr      nc,get_firstsc01
+                cp      '0'
+                jr      c,get_firstsc01
+                and     0fh                 ; convert number from ASCII to binary
+                ld      (first_sector),a
+get_firstsc02:  pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; abort from a get prompt
+;-----------------------------------------------------------------------------
+get_abort:
+                ; pop the registers pushed in the get call
+                pop     de
+                pop     bc
+                pop     hl
+
+                ; pop the stack since we won't be returning from the get call
+                pop     hl
+
+                jp      exit
+
+;-----------------------------------------------------------------------------
+; delay a safe amount before reading FDC busy bit (25.6 uS)
+; 1793 at 1MHz requires 12 uS for MFM and 24 uS for FM between
+; command register write and status register read for BUSY bit
+;-----------------------------------------------------------------------------
+; call:
+; return:
+;-----------------------------------------------------------------------------
+busy_delay:
+                push    af      ; 11 t-states = 11 * 0.49321 =  5.43 uS
+                pop     af      ; 10 t-states = 10 * 0.49321 =  4.93 uS
+                nop             ;  4 t-states =  4 * 0.49321 =  1.97 uS
+                ret             ; call + ret  = 27 * 0.49321 = 13.32 uS
+                                ;                      total = 25.65 uS
+
+;-----------------------------------------------------------------------------
+; delay a safe amount before reading FDC status bits (56.7 uS)
+; 1793 at 1MHz requires 28 uS for MFM and 56 uS for FM between
+; command register write and status register read for all but BUSY bit
+;-----------------------------------------------------------------------------
+; call:
+; return:
+;-----------------------------------------------------------------------------
+status_delay:
+                push    af      ; 11 t-states = 11 * 0.49321 =  5.43 uS
+                pop     af      ; 10 t-states = 10 * 0.49321 =  4.93 uS
+                push    af      ; 11 t-states = 11 * 0.49321 =  5.43 uS
+                pop     af      ; 10 t-states = 10 * 0.49321 =  4.93 uS
+                push    af      ; 11 t-states = 11 * 0.49321 =  5.43 uS
+                pop     af      ; 10 t-states = 10 * 0.49321 =  4.93 uS
+                push    af      ; 11 t-states = 11 * 0.49321 =  5.43 uS
+                pop     af      ; 10 t-states = 10 * 0.49321 =  4.93 uS
+                nop             ;  4 t-states =  4 * 0.49321 =  1.97 uS
+                ret             ; call + ret  = 27 * 0.49321 = 13.32 uS
+                                ;                      total = 56.73 uS
+
+;-----------------------------------------------------------------------------
+; print status register in binary
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+print_status:
+                ld      a,key_enter
+                call    vdchar
+                in      a,(cmdstatreg)
+                call    printbin
+                ld      a,key_enter
+                call    vdchar
+                ret
+
+;-----------------------------------------------------------------------------
+; prepare the sector interleave table
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+prepare_interl:
+                push    hl
+                push    bc
+                push    de
+                push    ix
+
+                ld      de,0                ; e contains table offset
+                push    de                  ; save initial offset
+                ld      a,(interleave)
+                ld      h,0
+                ld      l,a                 ; l contains interleave
+
+                ld      b,fm_sectors
+                ld      a,(density)
+                or      a
+                jr      z,prepint01
+                ld      b,mfm_sectors
+prepint01:      ld      c,0                 ; c contains sector number (0 based)
+
+prepint02:      ld      ix,interleave_tbl   ; point to the start of table
+                add     ix,de               ; add the offset for next sector
+                ld      (ix+0),c            ; store the sector number
+                inc     c                   ; increment sector number
+                ld      a,c                 ; check if sector number equals sectors per track
+                cp      b
+                jr      nc,prepint03        ; if so, it's done
+                ex      de,hl
+                add     hl,de               ; increment table offset by interleave value
+                ex      de,hl
+                ld      a,e                 ; check if offset is past end of track
+                cp      b
+                jr      c,prepint02         ; if not, loop and do next sector
+                pop     de                  ; retrieve last offset
+                inc     de                  ; increment the offset to next unused position
+                push    de                  ; save the offset
+                jr      prepint02           ; loop and do next sector
+
+prepint03:      pop     de                  ; remove offset from stack
+
+;                ld      hl,interleave_tbl
+;debug01:        ld      a,(hl)
+;                call    printhex
+;                ld      a,' '
+;                call    vdchar
+;                inc     hl
+;                djnz    debug01
+
+                pop     ix
+                pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; prepare the select_reg value
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+prepare_select:
+                push    hl
+                push    bc
+                push    ix
+                ld      a,(drive)
+                ld      b,0
+                ld      c,a
+                ld      ix,select_table
+                add     ix,bc
+                ld      a,(ix+0)
+                ld      hl,density
+                or      (hl)
+                ld      (select_reg),a
+                pop     ix
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; select drive
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+select_drive:
+                ld      a,(select_reg)
+                out     (drvselreg),a
+                ret
+
+;-----------------------------------------------------------------------------
+; restore drive heads to track 0 and select side 0
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+restore_heads:
+                push    hl
+                push    bc
+                call    select_drive
+                call    reset_fdc
+                ld      a,restore
+                out     (cmdstatreg),a
+                call    busy_delay
+restore01:      in      a,(cmdstatreg)
+                and     a,busy
+                jr      nz,restore01
+                in      a,(cmdstatreg)
+                and     a,track0
+                jr      nz,restore02
+                ld      hl,restore_errmsg
+                call    vdline
+                call    cleanup
+                jp      exit
+restore02:      ld      bc,delay_20ms       ; head settling time
+                call    delay
+                ld      hl,restore_done
+                call    vdline
+                xor     a
+                ld      (cylinder),a
+                call    set_side
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; wait for index hole to come and go
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+wait_index:
+                call    select_drive
+wait01:         in      a,(cmdstatreg)
+                and     index
+                jr      z,wait01
+                call    select_drive
+wait02:         in      a,(cmdstatreg)
+                and     index
+                jr      nz,wait02
+                ret
+
+;-----------------------------------------------------------------------------
+; step in one cylinder
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+stepinward:
+                ld      a,stepin
+                out     (cmdstatreg),a
+                call    busy_delay
+stepin01:       in      a,(cmdstatreg)
+                and     busy
+                jr      nz,stepin01
+                ld      bc,delay_20ms       ; head settling time
+                call    delay
+                ld      a,(cylinder)
+                inc     a
+                ld      (cylinder),a
+                call    update_write_precomp
+                ret
+
+;-----------------------------------------------------------------------------
+; update write precompensation flag
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+update_write_precomp:
+                push    hl
+
+                ld      hl,wrprecompcyl
+                ld      a,(density)         ; wpc only for mfm
+                or      a
+                ld      a,(select_reg)
+                jr      z,updatewpc00       ; disable the precomp if fm
+                ld      a,(cylinder)
+                cp      (hl)
+                ld      a,(select_reg)
+                jr      nc,updatewpc01
+updatewpc00:    and     ~writeprecomp
+                jr      updatewpc02
+updatewpc01:    or      writeprecomp
+updatewpc02:    ld      (select_reg),a
+
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; map sector from physical to logical
+;-----------------------------------------------------------------------------
+; call:     A contains physical sector number
+; return:   A contains interleaved sector number
+;-----------------------------------------------------------------------------
+map_sector:
+                push    hl
+                push    de
+                push    ix
+
+                ld      ix,interleave_tbl
+                ld      d,0
+                ld      e,a
+                add     ix,de
+                ld      a,(ix+0)
+                ld      hl,first_sector
+                add     (hl)
+                ld      (sector),a
+
+                pop     ix
+                pop     de
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; reset the floppy disk controller
+; 1793 at 1MHz requires 16 uS delay in MFM and 32 uS delay in FM after a reset
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+reset_fdc:
+                ld      a,forceint
+                out     (cmdstatreg),a
+                call    status_delay
+                ret
+
+;-----------------------------------------------------------------------------
+; seek to a cylinder and side
+;-----------------------------------------------------------------------------
+; call:     cylinder and side memory locations set to target values
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+; seek_cyl_side:
+;                 call    reset_fdc
+;                 ld      a,(side)
+;                 and     0x01
+;                 jr      z,seek_side0
+;                 ld      a,(select_reg)
+;                 or      side1
+;                 jr      seek_side1
+; seek_side0:     and     ~side1
+; seek_side1:     ld      (select_reg),a
+;                 out     (drvselreg),a
+;                 call    status_delay
+;                 ld      a,(cylinders)
+;                 out     (datareg),a
+;                 ld      a,seek
+;                 out     (cmdstatreg),a
+;       finish this up...needs interrupt routine
+
+;-----------------------------------------------------------------------------
+; set side
+;-----------------------------------------------------------------------------
+; call:     A contains desired side number (0 or 1)
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+set_side:
+                and     0x01
+                ld      (side),a
+                jr      change00
+
+;-----------------------------------------------------------------------------
+; change side
+;-----------------------------------------------------------------------------
+; call:
+; return:   A contains value of side bit in select reg & flags updated
+;-----------------------------------------------------------------------------
+change_side:
+                ; toggle current side
+                ld      a,(side)
+                xor     0x01
+                ld      (side),a
+
+                ; update side bit in select register
+change00:       ld      a,(select_reg)
+                jr      z,change01
+                or      side1
+                jr      change02
+change01:       and     ~side1
+change02:       ld      (select_reg),a
+                out     (drvselreg),a
+                and     side1
+                ret
+
+;-----------------------------------------------------------------------------
+; print write precompensation status
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+print_wpc:
+                ld      a,(select_reg)
+                and     writeprecomp
+                ld      a,' '
+                jr      z,printwpc01
+                ld      a,'*'
+printwpc01:     call    vdchar
+                ret
+
+;-----------------------------------------------------------------------------
+; prepare density dependent track parameters
+;-----------------------------------------------------------------------------
+; call:     'density' memory location must be set
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+prepare_track:
+                push    hl
+
+                ld      a,(density)
+                or      a
+                jr      z,prepare01
+
+                ; set up values for MFM format
+                ld      hl,mfm_index5
+                ld      (index_gap),hl
+
+                ld      hl,mfm_index5size
+                ld      (index_gap_size),hl
+
+                ld      hl,mfm_sector
+                ld      (sector_data),hl
+
+                ld      hl,mfm_sector_size
+                ld      (sector_data_sz),hl
+
+                ld      a,mfm_sectors
+                ld      (sectors),a
+                jr      prepare02
+
+                ; set up values for FM format
+prepare01:      ld      hl,fm_index5
+                ld      (index_gap),hl
+
+                ld      hl,fm_index5size
+                ld      (index_gap_size),hl
+
+                ld      hl,fm_sector
+                ld      (sector_data),hl
+
+                ld      hl,fm_sector_size
+                ld      (sector_data_sz),hl
+
+                ld      a,fm_sectors
+                ld      (sectors),a
+
+prepare02:      pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; generate memory image for write track command
+;-----------------------------------------------------------------------------
+; call:     'side' and 'cylinder' memory locations must be set
+;           'index_gap' and 'index_gap_size' locations must be set
+;           'sector_data' and 'sector_data_sz' locations must be set
+;
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+generate_track:
+                push    hl
+                push    bc
+                push    de
+                push    ix
+                push    iy
+
+                ; track buffer
+                ld      de,track_data
+
+                ; generate post index gap
+                ld      hl,(index_gap)
+                ld      bc,(index_gap_size)
+                ldir
+
+                ; generate sectors
+                ld      iy,sectors
+                xor     a
+generate01:     push    af                  ; save sector counter
+
+                ; calculate logical sector number
+                call    map_sector
+
+                ; calculate base pointer to IDAM locations
+                ld      ix,0
+                add     ix,de
+
+                ; copy sector data
+                ld      hl,(sector_data)
+                ld      bc,(sector_data_sz)
+                ldir
+
+                ld      a,(density)
+                cp      mfm
+                jr      z,generate02
+
+                ; write cylinder, side, and sector to FM IDAM field
+                ld      a,(cylinder)
+                ld      (ix+fm_idam_cyl),a
+                ld      a,(side)
+                ld      (ix+fm_idam_side),a
+                ld      a,(sector)
+                ld      (ix+fm_idam_sector),a
+                jr      generate03
+
+generate02:     ; write cylinder, side, and sector to MFM IDAM field
+                ld      a,(cylinder)
+                ld      (ix+mfm_idam_cyl),a
+                ld      a,(side)
+                ld      (ix+mfm_idam_side),a
+                ld      a,(sector)
+                ld      (ix+mfm_idam_sector),a
+
+generate03:     ; check if all sectors have been generated
+                pop     af                  ; restore sector counter
+                inc     a
+                cp      (iy+0)
+                jr      c,generate01
+
+                ; generate pre-index gap
+                push    de
+                pop     hl
+                inc     de
+                ld      bc,max_pre_idx_gap  ; write gap bytes until track ends
+                ld      ix,(index_gap)
+                ld      a,(ix+1)
+                ld      (hl),a
+                ldir
+
+                pop     iy
+                pop     ix
+                pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; format a track
+;-----------------------------------------------------------------------------
+; call:     drive and side should be selected with head positioned on cylinder
+; return:   A returns contents of FDC status register.
+;-----------------------------------------------------------------------------
+format_track:
+                push    hl
+                push    bc
+                push    de
+
+                ; reset the FDC
+                call    reset_fdc
+
+                ; disable INT and enable NMI
+                di
+                ld      a,fdc_irq
+                out     (irqreg),a
+
+                ; select drive and setup pointers
+                call    wait_index
+                ld      hl,track_data
+                ld      c,datareg
+
+                ; get select register value and add wait state enable flag
+                ld      a,(select_reg)
+                or      genwait
+                ld      d,a
+                ld      e,data_req
+
+                ; setup write track operation
+                ld      a,writetrack        ; issue format track command
+                out     (cmdstatreg),a
+                call    status_delay
+                call    status_delay
+
+                ; wait for first data request which comes immediately
+formatt01:      in      a,(cmdstatreg)      ; 5.5 uS
+                and     e                   ; 2.0 uS
+                jp      z,formatt01         ; 5.0 uS
+                outi                        ; 6.0 uS
+
+                ; wait for next data request which comes at index pulse
+formatt02:      in      a,(cmdstatreg)      ; 5.5 uS
+                and     e                   ; 2.0 uS
+                jp      z,formatt02         ; 5.0 uS
+                outi                        ; 6.0 uS
+                ld      a,d                 ; 2.0 uS
+
+                ; loop around wait state released by DRQ and terminated by fdc interrupt
+formatt03:      out     (drvselreg),a       ; 5.5 uS
+                outi                        ; 6.0 uS
+                jp      formatt03           ; 5.0 uS
+
+;-----------------------------------------------------------------------------
+; format disk
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+format_disk:
+                push    hl
+                push    de
+
+                ; reset, select, and restore to track 0 head 0
+                call    restore_heads
+
+formatd01:
+                ; display formatting cylinder and side message
+                ld      hl,formatting
+                call    vdline
+                ld      a,(cylinder)
+                call    printhexsp
+                ld      a,(side)
+                call    printhexsp
+                call    print_wpc
+
+                ; format a track
+                call    generate_track
+                call    format_track        ; returns status register
+                and     ~lost_data          ; mask out lost data since that is expected
+                or      a
+                jp      nz,formatd_err
+
+                ; check if two-sided
+                ld      a,(sides)
+                cp      2
+                jr      c,formatd02
+
+                ; increment side
+                call    change_side
+                jr      nz,formatd01
+
+                ; check if all cylinders have been formatted
+formatd02:      ld      a,(cylinder)
+                ld      hl,cylinders
+                inc     a
+                cp      (hl)
+                jr      z,formatd03
+                call    stepinward          ; step inward one cylinder
+                jr      formatd01
+formatd03:
+formatd_err:    pop     de
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; read sector
+;-----------------------------------------------------------------------------
+; call:
+; return:   A returns contents of FDC status register.
+;-----------------------------------------------------------------------------
+read_sector:
+                push    hl
+                push    bc
+                push    de
+
+                ; reset the FDC
+                call    reset_fdc
+
+                ; disable INT and enable NMI
+                di
+                ld      a,fdc_irq
+                out     (irqreg),a
+
+                ld      a,(cylinder)
+                out     (trackreg),a
+                ld      a,(sector)
+                out     (sectorreg),a
+
+                ; select drive and setup pointers
+                call    select_drive
+                ld      hl,read_data
+                ld      c,datareg
+
+                ; get select register value and add wait state enable flag
+                ld      a,(select_reg)
+                or      genwait
+                ld      d,a
+                ld      e,data_req
+
+                ; check which side is being read
+                ld      a,(side)
+                or      a
+                jr      nz,readsect01
+                ld      a,readsector_s0
+                jr      readsect02
+readsect01:     ld      a,readsector_s1
+readsect02:     out     (cmdstatreg),a
+
+readsect03:     in      a,(cmdstatreg)
+                and     e
+                jp      z,readsect03
+                outi
+                ld      a,d
+
+readsect04:     out     (drvselreg),a
+                ini
+                jp      readsect04
+
+;-----------------------------------------------------------------------------
+; read all sectors
+;-----------------------------------------------------------------------------
+; call:
+; return:   A=0 for success, flags updated
+;-----------------------------------------------------------------------------
+read_all_sectors:
+                push    hl
+                push    bc
+
+                ld      hl,first_sector
+                ld      a,(sectors)
+                add     (hl)
+                ld      b,a
+                ld      a,(hl)
+readall01:      ld      (sector),a
+                call    read_sector         ; returns status register
+                or      a
+                jr      nz,readall_err
+
+                ; increment to next sector
+                ld      a,(sector)
+                inc     a
+                cp      b
+                jr      c,readall01
+
+                ; clear a and update flags to indicate success to caller
+                xor     a
+
+readall_err:    pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; verify disk
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+verify_disk:
+                push    hl
+
+                ; reset, select, and restore to track 0 head 0
+                call    restore_heads
+
+verifyd01:
+                ; display verifying cylinder and side message
+                ld      hl,verifying
+                call    vdline
+                ld      a,(cylinder)
+                call    printhexsp
+                ld      a,(side)
+                call    printhexsp
+
+                ; read a track
+                call    read_all_sectors    ; returns status register
+                or      a
+                jr      nz,verifyd_err
+
+                ; check if two-sided
+                ld      a,(sides)
+                cp      2
+                jr      c,verifyd02
+
+                ; increment side
+                call    change_side
+                jr      nz,verifyd01
+
+                ; check if all cylinders have been verified
+verifyd02:      ld      a,(cylinder)
+                ld      hl,cylinders
+                inc     a
+                cp      (hl)
+                jr      z,verifyd03
+                call    stepinward          ; step inward one cylinder
+                jr      verifyd01
+
+verifyd03:
+verifyd_err:    pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; write sector
+;-----------------------------------------------------------------------------
+; call:
+; return:   A returns contents of FDC status register.
+;-----------------------------------------------------------------------------
+write_sector:
+                push    hl
+                push    bc
+                push    de
+
+                ; reset the FDC
+                call    reset_fdc
+
+                ; disable INT and enable NMI
+                di
+                ld      a,fdc_irq
+                out     (irqreg),a
+
+                ld      a,(cylinder)
+                out     (trackreg),a
+                ld      a,(sector)
+                out     (sectorreg),a
+
+                ; select drive and setup pointers
+                call    select_drive
+                ld      hl,write_data
+                ld      c,datareg
+
+                ; get select register value and add wait state enable flag
+                ld      a,(select_reg)
+                or      genwait
+                ld      d,a
+                ld      e,data_req
+
+                ; check which side is being written
+                ld      a,(side)
+                or      a
+                jr      nz,writesect01
+                ld      a,writesector_s0
+                jr      writesect02
+writesect01:    ld      a,writesector_s1
+writesect02:    out     (cmdstatreg),a
+                call    status_delay
+
+writesect03:    in      a,(cmdstatreg)
+                and     e
+                jp      z,writesect03
+                outi
+                ld      a,d
+
+                ld      b,64h               ; wait a bit
+                djnz    $
+
+writesect04:    out     (drvselreg),a
+                outi
+                jp      writesect04
+
+;-----------------------------------------------------------------------------
+; write all sectors
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+write_all_sectors:
+                push    hl
+                push    bc
+
+                ld      hl,first_sector
+                ld      a,(sectors)
+                add     (hl)
+                ld      b,a
+                ld      a,(hl)
+writeall01:     ld      (sector),a
+                call    fill_data           ; fills buffer with sector number
+                call    write_sector        ; returns status register
+                or      a
+                jr      nz,writeall_err
+
+                ; increment to next sector
+                ld      a,(sector)
+                inc     a
+                cp      b
+                jr      c,writeall01
+
+                ; clear a and update flags to indicate success to caller
+                xor     a
+
+writeall_err:   pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; fill data
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+fill_data:
+                push    hl
+                push    bc
+                push    de
+
+                ld      hl,write_data
+                ld      de,write_data+1
+                ld      bc,255
+                ld      a,(sector)
+                ld      (hl),a
+                ldir
+
+                pop     de
+                pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; write disk
+;-----------------------------------------------------------------------------
+; call:
+; return:   A destroyed
+;-----------------------------------------------------------------------------
+write_disk:
+                push    hl
+
+                ; reset, select, and restore to track 0 head 0
+                call    restore_heads
+
+writed01:
+                ; display writing cylinder and side message
+                ld      hl,writing
+                call    vdline
+                ld      a,(cylinder)
+                call    printhexsp
+                ld      a,(side)
+                call    printhexsp
+                call    print_wpc
+
+                ; write a track
+                call    write_all_sectors   ; returns status register
+                or      a
+                jr      nz,writed_err
+
+                ; check if two-sided
+                ld      a,(sides)
+                cp      2
+                jr      c,writed02
+
+                ; increment side
+                call    change_side
+                jr      nz,writed01
+
+                ; check if all cylinders have been written
+writed02:       ld      a,(cylinder)
+                ld      hl,cylinders
+                inc     a
+                cp      (hl)
+                jr      z,writed03
+                call    stepinward          ; step inward one cylinder
+                jr      writed01
+
+writed03:
+writed_err:     pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; read a track
+;-----------------------------------------------------------------------------
+; call:     drive and side should be selected with head positioned on cylinder
+; return:   A returns contents of FDC status register.
+;-----------------------------------------------------------------------------
+read_track:
+                push    hl
+                push    bc
+                push    de
+
+                ; reset the FDC
+                call    reset_fdc
+
+                ; disable INT and enable NMI
+                di
+                ld      a,fdc_irq
+                out     (irqreg),a
+
+                ; select drive and setup pointers
+                call    wait_index
+                ld      hl,track_data
+                ld      c,datareg
+
+                ; get select register value and add wait state enable flag
+                ld      a,(select_reg)
+                or      genwait
+                ld      d,a
+                ld      e,data_req
+
+                ; setup read track operation
+                ld      a,readtrack         ; issue read track command
+                out     (cmdstatreg),a
+                call    status_delay
+
+                ; wait for next data request which comes at index pulse
+readt02:        in      a,(cmdstatreg)
+                and     e
+                jp      z,readt02
+                ini
+                ld      a,d
+
+                ; loop around wait state released by DRQ and terminated by fdc interrupt
+readt03:        out     (drvselreg),a
+                ini
+                jp      readt03
+
+;-----------------------------------------------------------------------------
+; dump track
+;-----------------------------------------------------------------------------
+; call:
+; return:   A returns contents of FDC status register.
+;-----------------------------------------------------------------------------
+dump_track:
+                push    hl
+                push    bc
+
+                ; reset, select, and restore to track 0 head 0
+                call    restore_heads
+
+dumpd01:
+                ; clear screen
+                call    vdcls
+
+                ; read a track
+                call    read_track          ; returns status register
+                or      a
+                jr      nz,dumpd02
+
+                ld      hl,track_data       ; no error, display the data
+                ld      bc,511
+dloop:          ld      a,(hl)
+                call    printhex
+                inc     hl
+                dec     bc
+                ld      a,b
+                or      c
+                jr      nz,dloop
+                xor     a
+
+dumpd02:        pop     bc
+                pop     hl
+                ret
+
+;-----------------------------------------------------------------------------
+; include other modules
+;-----------------------------------------------------------------------------
+include util.z80
+include template.z80
+
+;-----------------------------------------------------------------------------
+; message strings and tables
+;-----------------------------------------------------------------------------
+message:        db      'TRS-80 Model III Tape-based Floppy Disk Formatter v1.4',0ah
+                db      '2021-04-15 Amardeep Chana -- asc135@yahoo.com',0ah
+                db      'This program is in the public domain.',0dh
+prompt0:        db      'Operation (F)ormat (R)ead (W)rite (D)ump [F] ?',03h
+prompt1:        db      'Drive              [0] ?',03h
+prompt2:        db      'Cylinders         [40] ?',03h
+prompt3:        db      'WritePrecompCyl   [25] ?',03h
+prompt4:        db      'Sides              [1] ?',03h
+prompt5:        db      'Density            [D] ?',03h
+prompt6:        db      'Interleave         [2] ?',03h
+prompt7:        db      'FirstSector        [0] ?',03h
+prompt8:        db      'Insert target disk in drive then <ENTER> or <BREAK> to abort.',0dh
+restore_done:   db      'Head restore complete.',0dh
+restore_errmsg: db      'Head restore failed.',0dh
+formatting:     db      1dh,'Formatting Cylinder/Side:',03h
+verifying:      db      1dh,'Verifying Cylinder/Side: ',03h
+writing:        db      1dh,'writing Cylinder/Side:   ',03h
+error_msg:      db      0dh,'FDC Error occurred.',0dh
+done:           db      0ah,'...Done.',0dh
+select_table:   db      01h, 02h, 04h, 08h
+
+;-----------------------------------------------------------------------------
+; data
+;-----------------------------------------------------------------------------
+data_start:     equ     $
+operation:      ds      1                   ; operation to perform
+drive:          ds      1                   ; target drive
+cylinders:      ds      1                   ; number of cylinders to format
+wrprecompcyl:   ds      1                   ; cylinder to start write precomp
+sides:          ds      1                   ; number of sides to format
+density:        ds      1                   ; single or double
+interleave:     ds      1                   ; sector interleave
+first_sector:   ds      1                   ; first sector number
+sectors:        ds      1                   ; number of sectors per track
+select_reg:     ds      1                   ; shadow of select register
+cylinder:       ds      1                   ; current cylinder
+side:           ds      1                   ; current side
+sector:         ds      1                   ; current sector
+index_gap:      ds      2                   ; pointer to index gap data
+index_gap_size: ds      2                   ; size of index gap data
+sector_data:    ds      2                   ; pointer to sector data
+sector_data_sz: ds      2                   ; size of sector data
+interleave_tbl: ds      18                  ; physical sector interleave table
+input_buffer:   ds      16                  ; user input buffer
+input_buf_size: equ     $-input_buffer-1    ; user input buffer size
+data_size:      equ     $-data_start        ; size of data area
+read_data:                                  ; sector read buffer
+write_data:                                 ; sector write buffer
+track_data:     equ     $                   ; track data buffer
+
+                end     start

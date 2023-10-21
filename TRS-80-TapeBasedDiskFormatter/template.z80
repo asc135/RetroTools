@@ -1,0 +1,80 @@
+;-----------------------------------------------------------------------------
+; Tape-based Floppy Disk Formatter
+; TRS-80 Model III 16K or more with FDC
+; Assembles with zmac (http://48k.ca/zmac.html)
+;-----------------------------------------------------------------------------
+; This software is in the public domain.  No warranty expressed nor implied.
+;-----------------------------------------------------------------------------
+; 2021-03-25 A. Chana       Initial Release
+; 2021-03-29 A. Chana       Corrected mfm 5" gap sizes.
+; 2021-03-31 A. Chana       Corrected mfm and fm 5" gap 3 sizes.
+;-----------------------------------------------------------------------------
+
+;-----------------------------------------------------------------------------
+; FM 8" floppy index table
+;-----------------------------------------------------------------------------
+fm_index8:      dc      40,0xff             ; pre-index gap
+                dc       6,0x00
+                dc       1,0xfc             ; index address mark
+                dc      26,0xff             ; gap 1a
+fm_index8size:  equ     $-fm_index8
+
+;-----------------------------------------------------------------------------
+; MFM 8" floppy index table
+;-----------------------------------------------------------------------------
+mfm_index8:     dc      80,0x4e             ; pre-index gap
+                dc      12,0x00
+                dc       3,0xf6             ; index address mark sync bytes
+                dc       1,0xfc             ; index address mark
+                dc      50,0x4e             ; gap 1a
+mfm_index8size: equ     $-mfm_index8
+
+;-----------------------------------------------------------------------------
+; FM 5" floppy index table
+;-----------------------------------------------------------------------------
+fm_index5:      dc      13,0xff             ; gap 1a
+fm_index5size:  equ     $-fm_index5
+
+;-----------------------------------------------------------------------------
+; MFM 5" floppy index table
+;-----------------------------------------------------------------------------
+mfm_index5:     dc      31,0x4e             ; gap 1a
+mfm_index5size: equ     $-mfm_index5
+
+;-----------------------------------------------------------------------------
+; FM sector table
+;-----------------------------------------------------------------------------
+fm_sector:      dc       6,0x00             ; gap 1b
+                dc       1,0xfe             ; id address mark
+                dc       1,0x00             ; cylinder number (0-nn)
+                dc       1,0x00             ; side number (0-1)
+                dc       1,0x00             ; sector number (0-9)
+                dc       1,0x01             ; sector size (1 = 256 bytes)
+                dc       1,0xf7             ; 2 CRC bytes generated and written
+                dc      12,0xff             ; gap 2a
+                dc       6,0x00             ; gap 2b
+                dc       1,0xfb             ; data address mark
+                dc     256,0xe5             ; data
+                dc       1,0xf7             ; 2 CRC bytes generated and written
+                dc      14,0xff             ; gap 3 (27 for IBM format)
+fm_sector_size  equ     $-fm_sector
+
+;-----------------------------------------------------------------------------
+; MFM sector table
+;-----------------------------------------------------------------------------
+mfm_sector:     dc      12,0x00             ; gap 1b
+                dc       3,0xf5             ; id address mark sync bytes
+                dc       1,0xfe             ; id address mark
+                dc       1,0x00             ; cylinder number (0-nn)
+                dc       1,0x00             ; side number (0-1)
+                dc       1,0x00             ; sector number (0-17 or 1-18)
+                dc       1,0x01             ; sector size (1 = 256 bytes)
+                dc       1,0xf7             ; 2 CRC bytes generated and written
+                dc      22,0x4e             ; gap 2a
+                dc      12,0x00             ; gap 2b
+                dc       3,0xf5             ; data address mark sync bytes
+                dc       1,0xfb             ; data address mark
+                dc     256,0xe5             ; data
+                dc       1,0xf7             ; 2 CRC bytes generated and written
+                dc      24,0x4e             ; gap 3 (54 for IBM format)
+mfm_sector_size equ     $-mfm_sector
