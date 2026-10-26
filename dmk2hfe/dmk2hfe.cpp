@@ -1,3 +1,7 @@
+// Copyright 2026 Amardeep Chana
+// This software was created with the help of Claude Sonnet 5.5.
+// It is free software under the MIT license.
+//
 // dmk2hfe.cpp - Convert a DMK disk image (TRS-80 / David Keil format) to an
 // HxC Floppy Emulator HFE (v1) image.
 //
